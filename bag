@@ -1,0 +1,597 @@
+#!/bin/bash
+#/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+readonly VERSION='0.0.1'
+
+# export PROOT_NO_SECCOMP=1
+# export PROOT_VERBOSE=9
+
+export D=false
+export V=false
+export E=false
+
+function dbg() {
+  if ! ${D}; then return 0; fi
+  local t=
+  if [[ $# -gt 2 ]]; then
+    t=${1-}
+    shift
+    t="$t | $@"
+  else
+    t="$@"
+  fi
+  echo -e "$(date +%y-%m-%d-%T) | $t" >&2 
+}
+function vrb() {
+  if ! ${V}; then return 0; fi
+  echo "$@"
+}
+function err() { 
+  echo -e "$@" >&2 
+  export E=true
+  return 1
+}
+
+if [[ -z ${PREFIX-} ]]; then
+  export WORK=${WORK-"$HOME/.bag"}
+  mkdir -p "$WORK"
+else
+  export WORK=${WORK-"$PREFIX/share/bag"}
+  mkdir -p "$WORK"
+fi
+
+export DIR__IMAGES=${DIR__IMAGES-${WORK}/images}
+export DIR__INSTANCES=${DIR__INSTANCES-${WORK}/instances}
+
+export CMD__DOWNLOAD=${CMD__DOWNLOAD-_bag_curl}
+export CMD__VERIFY=${CMD__VERIFY-_bag_verify}
+export CMD__GET_ARCH=${CMD__GET_ARCH-_bag_arch}
+
+export FIL__URL=${FIL__URL-}
+export FIL__IMAGE=${FIL__IMAGE-}
+export FIL__ENTRY=${FIL__ENTRY-bag_entry_point.sh}
+
+export _PROOT_EXT='--link2symlink'
+export _PROOT_UID='-0'
+export _PROOT_CWD='-w /'
+export _PROOT_MNT="-b /dev/ -b /sys/ -b /proc/ -b /storage/ -b /sdcard/ -b $HOME"
+export _PROOT_VEN="/usr/bin/env HOME=/root PREFIX=/usr SHELL=/bin/sh TERM=$TERM LANG=$LANG PATH=/bin:/usr/bin:/sbin:/usr/sbin"
+
+export VEN__ALPINE_VER=${VEN__ALPINE_VER-}
+export VEN__ALPINE_URL=${VEN__ALPINE_URL-}
+export VEN__ALPINE_BASE='http://dl-cdn.alpinelinux.org/alpine/latest-stable/releases'
+
+export DEF_VENDOR=${DEF_VENDOR-alpine}
+export DEF_INSTANCE='bagdefault'
+
+export VAL__USER_AGENT=${VAL__USER_AGENT-'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.79 Safari/537.36'}
+export ARCH=${ARCH-}
+export VAL__CACHE=${VAL__CACHE-$(dirname `mktemp -u`)/bag}
+
+
+export _INSTANCE=
+
+# =====================================
+
+function _bag_proot() {
+  local r=$1
+  local _proot=
+  local ven=
+  shift 1
+
+  if [[ ! -z "$r" ]]; then
+    r="-r $_INSTANCE"
+    ven="$_PROOT_VEN"
+  else
+    r=
+    ven=
+  fi
+
+  _proot="proot $_PROOT_EXT $_PROOT_UID $r $_PROOT_MNT $_PROOT_CWD $ven"
+  vrb "$_proot $@"
+  unset LD_PRELOAD
+  exec $_proot $@
+  # strace -vs5000 -o trace.txt $_proot $@
+}
+
+function _bag_curl() { # CMD__DOWNLOAD
+ dbg "$LINENO::$FUNCNAME" "() $@"
+ mkdir -p $(dirname "$2")
+ curl -L --progress-bar            \
+   --user-agent "$VAL__USER_AGENT" \
+   -o "$2"                         \
+   "$1"
+ local e=$?
+ if [[ $e -gt 0 ]]; then
+  err "$LINENO::$FUNCNAME" \
+      "curl error"
+  return $e
+ fi
+} # ========================= _bag_curl
+
+function _bag_verify() { # CMD__VERIFY
+ dbg "$LINENO::$FUNCNAME" "() $@"
+
+ local src="$1"
+ local dst="$2"
+ local chk="${3-}"
+
+ if [[ -z "$chk" ]]; then
+   return 0;
+ elif [[ ! "$chk" == 'sha256' ]]; then
+  err "$LINENO::$FUNCNAME" \
+      "check sum not supported: $3"
+  return 1
+ fi
+
+ src="${src}.sha256"
+ dst="${dst}.sha256"
+
+ _bag_curl "$src" "$dst"
+ local e=$?
+ if [[ $e -gt 0 ]]; then
+  err "$LINENO::$FUNCNAME" \
+      "curl error"
+  return $e
+ fi
+
+ cd $(dirname "$dst")
+ sha256sum -c $(basename "$dst")
+ e=$?
+ if [[ $e -gt 0 ]]; then
+  err "$LINENO::$FUNCNAME" \
+      "verification error"
+  return $e
+ fi
+} # ======================= _bag_verify
+
+function _bag_arch() {
+ dbg "$LINENO::$FUNCNAME" "() $@"
+
+ if [[ ! -z "${ARCH-}" ]]; then
+   dbg "$LINENO::$FUNCNAME" "def: $ARCH"
+   return 0
+ fi
+
+ if which getprop 1>/dev/null 2>/dev/null; then
+   dbg "$LINENO::$FUNCNAME" \
+       "call: getprop ro.product.cpu.abi"
+   export ARCH=$(getprop ro.product.cpu.abi)
+ elif which uname -p 1>/dev/null 2>/dev/null; then
+   export ARCH=$(uname -p)
+ elif lscpu 1>/dev/null 2>/dev/null; then
+   export ARCH=$(lscpu | grep -i Architecture | cut -f2 -d: | tr -d ' ')
+ else
+   err "$LINENO::$FUNCNAME" \
+       "no method to get cpu arch"
+   return 1
+ fi
+ if [[ -z "$ARCH" ]]; then
+   err "$LINENO::$FUNCNAME" \
+       "could not get arch"; return 1
+ fi
+
+ dbg "$LINENO::$FUNCNAME" \
+     "call: $CMD__GET_ARCH -> $ARCH"
+ local a="$ARCH"
+ [[ "$a" = *86*  ]] && ARCH='x86'
+ [[ "$a" = *64*  ]] && ARCH='x86_64'
+ [[ "$a" = *arm* ]] && ARCH='armhf'
+ [[ "$a" = *64*  ]] && \
+ [[ "$a" = *arm* ]] && ARCH='aarch64'
+ export ARCH="$ARCH"
+ dbg "$LINENO::$FUNCNAME" \
+     "ARCH=$ARCH"
+} # ==================== _bag_arch
+
+function _bag_find_ver() {
+ dbg "$LINENO::$FUNCNAME" "() $@"
+
+ local arch="$1"
+
+ if [[ ! -z "$VEN__ALPINE_VER" ]]; then
+   dbg "$LINENO::$FUNCNAME" \
+       "def: $VEN__ALPINE_VER"
+   return 0
+ fi 
+
+ cache="$VAL__CACHE/bag__alpine_version_cache.txt"
+ if [[   -f "$cache"          ]] && \
+    [[ ! -z "$(cat ${cache})" ]]; then
+   dbg "$LINENO::$FUNCNAME" \
+       "using cache: $cache"
+ else
+  dbg "$LINENO::$FUNCNAME" \
+      "(re)creating cache: $cache"
+  _bag_arch
+  rm -rf "$cache"
+  
+  ${CMD__DOWNLOAD} \
+    "$VEN__ALPINE_BASE/$arch/latest-releases.yaml" \
+    "$cache"
+ fi
+
+ export VEN__ALPINE_VER=$(cat "$cache" | grep -m 1 -o version.* | sed -e 's/[^0-9.]*//g' -e 's/-$//')
+
+ if [[ -z "$VEN__ALPINE_VER" ]]; then
+   err "$LINENO::$FUNCNAME" \
+       "could not get alpine version"
+   return 1
+ fi
+} # ===================== _bag_find_ver
+
+function _bag_find_image() {
+ dbg "$LINENO::$FUNCNAME" "() $@"
+
+ [[ "${1-alpine}" != 'alpine' ]] &&
+  err "$LINENO::$FUNCNAME" \
+      "unsupported image: $1" && return 1;
+
+ if [[ -z "$FIL__IMAGE" ]]; then
+   _bag_arch
+   _bag_find_ver "$ARCH"
+   export FIL__IMAGE="alpine-minirootfs-$VEN__ALPINE_VER-$ARCH.tar.gz"
+ fi
+
+ dbg "$LINENO::$FUNCNAME" \
+     "image file: $DIR__IMAGES/$FIL__IMAGE"
+
+ [[ -z "$VEN__ALPINE_URL" ]] && \
+   export VEN__ALPINE_URL="$VEN__ALPINE_BASE/$ARCH/$FIL__IMAGE"
+ export FIL__URL="$VEN__ALPINE_URL"
+
+ dbg "$LINENO::$FUNCNAME" \
+     "file url: $FIL__URL"
+} # =================== _bag_find_image
+
+function _bag_download() {
+ dbg "$LINENO::$FUNCNAME" "() $@"
+
+  local src="$1"
+  local dst="$DIR__IMAGES/$2"
+  local chk="${3-}"
+
+  mkdir -p $(dirname "$dst")
+
+  if [[ -f "$src" ]]; then
+    dbg "$LINENO::$FUNCNAME"
+        "local file: $src -> $dst"
+    cp -v "$src" "$dst"
+  else 
+    ${CMD__DOWNLOAD} "$src" "$dst" \
+      || return 1
+  fi
+
+  dbg "$LINENO::$FUNCNAME" \
+      "${CMD__VERIFY} $src $dst $chk"
+  ${CMD__VERIFY} "$src" "$dst" "$chk" || \
+    err "$LINENO::$FUNCNAME" \
+        "image verification failed" && \
+        return 1
+} # ===================== _bag_download
+
+function _bag_instance_path() {
+ dbg "$LINENO::$FUNCNAME" "() $@"
+
+ local ins="$1"
+ local mod="$2"
+ local path=${OVERRIDE_INSTANCE-"$DIR__INSTANCES/bag__$ins"}
+
+ if [[ -z "$ins" ]]; then
+  err "$LINENO::$FUNCNAME" "instance name empty"
+  exit 127;
+ fi
+ if [[ "$mod" -eq 1 ]] && [[ ! -d "$path" ]]; then
+  err "$LINENO::$FUNCNAME" "not a directory: $path"
+  exit 129
+ fi
+ if [[ "$mod" -eq 2 ]] && [[ -e "$path" ]]; then
+  err "$LINENO::$FUNCNAME" "path not empty: $path"
+  exit 131
+ fi
+ _INSTANCE="$path"
+} # ================ _bag_instance_path
+
+# =============================================================================
+
+function bag_exec()   { err "$LINENO::$FUNCNAME" 'not implemented'; }
+function bag_import() { err "$LINENO::$FUNCNAME" 'not implemented'; }
+function bag_kill()   { err "$LINENO::$FUNCNAME" 'not implemented'; }
+function bag_pull()   { err "$LINENO::$FUNCNAME" 'not implemented'; }
+function bag_push()   { err "$LINENO::$FUNCNAME" 'not implemented'; }
+function bag_rename() { err "$LINENO::$FUNCNAME" 'not implemented'; }
+
+function bag_version() {
+  echo "$VERSION"
+} # ======================= bag_version
+
+function bag_ps() {
+  mkdir -p "$DIR__INSTANCES"
+  echo "ls -Aho $@ $DIR__INSTANCES" 
+  ls -Aho $@ "$DIR__INSTANCES" 
+} # ============================ bag_ps
+
+function bag_images() {
+  mkdir -p "$DIR__IMAGES"
+  echo "ls -Aho $@ $DIR__IMAGES" 
+  ls -Aho $@ "$DIR__IMAGES" 
+} # ======================== bag_images
+
+function bag_rmi() {
+  [[ $# -lt 1 ]] && err usag 'image id is required' && return 1
+  local img="$1"
+  _bag_find_image "$1"
+  ${E} && return 1
+
+  if [[ -z "$FIL__IMAGE" ]]; then
+    echo 'assertion error'
+    exit 1
+  fi
+
+  echo "rm -rf $DIR__IMAGES/$FIL__IMAGE"
+  rm -f "$DIR__IMAGES/$FIL__IMAGE"
+  echo "rm -rf $DIR__IMAGES/$FIL__IMAGE.sha*"
+  rm -f "$DIR__IMAGES/$FIL__IMAGE.sha*"
+} # =========================== bag_rmi
+
+function bag_rm() {
+  [[ $# -lt 1 ]] && err usag 'instance id is required' && return 1
+  _bag_instance_path "$1" 1
+  echo "rm -rf $_INSTANCE"
+  rm -rf "$_INSTANCE"
+} # ============================ bag_rm
+
+function bag_export() {
+  [[ $# -lt 1 ]] && err usag 'instance id is required' && return 1
+  _bag_instance_path "$1" 1
+  local to_file=$([[ $# -gt 2 ]] && [[ "$2" = '-o' ]] && echo "$3" || echo '')
+  if [[ -z "$to_file" ]]; then
+    shift 1
+    tar -c $@ "$_INSTANCE"
+  else
+    shift 3
+    echo "tar -cf $to_file $@ $_INSTANCE"
+    tar -cf "$to_file" $@ "$_INSTANCE"
+  fi
+} # ======================== bag_export
+
+function bag_cp() {
+  [[ $# -lt 1 ]] && err usag 'src is required' && return 1
+  [[ $# -lt 2 ]] && err usag 'dst is required' && return 1
+  local src="$1"
+  local dst="$2"
+  local src0=$(echo "$src" | cut -f1 -d:)
+  local src1=$(echo "$src" | cut -f2 -d:)
+  local dst0=$(echo "$dst" | cut -f1 -d:)
+  local dst1=$(echo "$dst" | cut -f2 -d:)
+  if [[ ! -z "$src0" ]] && [[ ! -z "$src1" ]]; then
+    # from instance to dest
+    _bag_instance_path "$src0" 1
+    echo "cp -rv $_INSTANCE/$src1 $dst"
+    cp -rv "$_INSTANCE/$src1" "$dst"
+  else
+    # from local to instance
+    _bag_instance_path "$dst0" 1
+    mkdir -p "$_INSTANCE/$dst1"
+    echo "cp -rv $src $_INSTANCE/$dst1"
+    cp -rv "$src" "$_INSTANCE/$dst1"
+  fi
+} # ============================ bag_cp
+
+function bag_create() {
+  [[ $# -lt 1 ]] && err usag 'instance id is required' && return 1
+  mkdir -p "$DIR__INSTANCES"
+
+  dbg "$LINENO::$FUNCNAME" \
+      "getting instance path"
+  _bag_instance_path "$1" 2
+
+  dbg "$LINENO::$FUNCNAME" \
+      "checking if image exists"
+  _bag_find_image "${2-alpine}"
+  ${E} && return 1
+
+  if ! [[ -e "$DIR__IMAGES/$FIL__IMAGE" ]]; then
+    dbg "$LINENO::$FUNCNAME" \
+        "image not found locally, downloading: $FIL__URL $FIL__IMAGE"
+    _bag_download "$FIL__URL" "$FIL__IMAGE" sha256
+    ${E} && return 1
+  else
+    dbg "$LINENO::$FUNCNAME" \
+        "image found locally: $DIR__IMAGES/$FIL__IMAGE"
+  fi
+  ${E} && return 1
+
+  mkdir -p "$_INSTANCE"
+  cd "$_INSTANCE"
+
+  vrb "proot --link2symlink -0 tar -xpf $DIR__IMAGES/$FIL__IMAGE"
+  pushd "$_INSTANCE"
+  proot --link2symlink -0 tar -xpf "$DIR__IMAGES/$FIL__IMAGE"
+  popd
+  if [[ ! -d "$_INSTANCE/etc" ]]; then
+    err "$LINENO::$FUNCNAME" \
+        "could not create root env"
+    return 1
+  fi
+  echo "nameserver 8.8.8.8 >> $_INSTANCE/etc/resolv.conf"
+  echo "nameserver 8.8.4.4 >> $_INSTANCE/etc/resolv.conf"
+  echo "nameserver 8.8.8.8" >> "$_INSTANCE/etc/resolv.conf"
+  echo "nameserver 8.8.4.4" >> "$_INSTANCE/etc/resolv.conf"
+  if [[ $# -gt 3 ]]; then
+    local entry_file="$_INSTANCE/$FIL__ENTRY"
+    echo '#!/bin/bash'  > "$entry_file"
+    echo ''            >> "$entry_file"
+    echo "$@"          >> "$entry_file"
+    chmod u+x             "$entry_file"
+  fi
+} # ======================== bag_create
+
+function bag_run() {
+  [[ $# -lt 1 ]] && \
+    err usag 'instance id is required' && return 1
+
+  dbg "$LINENO::$FUNCNAME" \
+      "checking for instance: $1"
+  _bag_instance_path "$1" 0
+  if [[ ! -d "$_INSTANCE" ]]; then
+    dbg "$LINENO::$FUNCNAME" \
+        "no instance, creating: $1 $DEF_VENDOR"
+    bag_create "$1" "$DEF_VENDOR"
+    ${E} && return 1
+  fi
+  _bag_instance_path "$1" 1
+  shift
+  dbg "$LINENO::$FUNCNAME" \
+      "instance: $_INSTANCE"
+
+  if [[ ! -z "$FIL__ENTRY" ]] && \
+    [[ -x "$_INSTANCE/$FIL__ENTRY" ]]; then
+    _bag_proot "$_INSTANCE" "$FIL__ENTRY" $@
+  elif [[ $# -eq 0 ]]; then
+    _bag_proot "$_INSTANCE" /bin/sh --login
+  else
+    _bag_proot "$_INSTANCE" $@
+  fi
+} # =========================== bag_run
+
+function bag_execute_def() {
+  bag_run "$DEF_INSTANCE" $@
+} # =================== bag_execute_def
+
+function bag_help() {
+  msg=$(cat << EOT
+
+exec           NOT IMPLEMENTED
+import         NOT IMPLEMENTED
+kill           NOT IMPLEMENTED
+pull           NOT IMPLEMENTED
+push           NOT IMPLEMENTED
+rename         NOT IMPLEMENTED
+
+rmi            
+
+version        prints bag version
+images         prints list of downloaded
+               images [docker images]
+rm:            deletes an instance
+               [docker rm]
+
+ps             list of available
+               instances [docker ps]
+
+export id [-o file]
+> export the instance with id [id] to
+> stdout as a tar archive, unless -o is
+> given which exports to given file.
+
+cp id:src dst
+cp src id:dst
+> copies the file or directory [src] in
+> the instance [id] into the destination
+> [dst] or vice versa
+
+run id command
+> first, creates the instance [id] if it
+> does not already exists with the
+> default vendor=${DEF_VENDOR}, then
+> then run [command] in it.
+
+Version: ${VERSION}
+Author:  Koosha <i@koosha.io>
+.
+
+EOT
+)
+  echo "$msg"
+}
+function bag_h() { bag_help; }
+
+readonly cmd="${1-}"
+readonly func="bag_$cmd"
+[[ $# -gt 0 ]] && shift
+
+[[ ! -z "${BAG_DEBUG-}"  ]] && \
+[[ ! "$BAG_DEBUG" -eq 0 ]] && D=true
+[[ ! -z "${BAG_VERBOSE-}"  ]] && \
+[[ ! "$BAG_VERBOSE" -eq 0 ]] && V=true
+[[ ! -z "${BAG_SCREAM-}"  ]] && \
+[[ ! "$BAG_SCREAM" -eq 0 ]] && set -x
+
+case "$cmd" in
+  ''|h|help|-h|-help|--help)
+    bag_help $@
+    exit 0
+    ;;
+
+  -v|--version|version)
+    bag_version $@
+    exit 0
+    ;;
+
+  ps)
+    bag_ps $@
+    exit 0
+    ;;
+
+  i|im|ima|imag|image|images)
+    bag_images $@
+    exit 0
+    ;;
+
+  rmi)
+    bag_rmi $@
+    exit 0
+    ;;
+
+  rm)
+    bag_rm $@
+    exit 0
+    ;;
+
+  rmd)
+    bag_rm $DEF_INSTANCE
+    exit 0
+    ;;
+
+
+  cp)
+    bag_cp $@
+    exit 0
+    ;;
+
+  e|ex|exp|expo|export)
+    bag_export $@
+    exit 0
+    ;;
+
+  c|cr|cre|crea|creat|create)
+    bag_create $@
+    exit 0
+    ;;
+
+  r|ru|run)
+    bag_run $@
+    exit 0
+    ;;
+
+  x|execute-default)
+    bag_execute_def $@
+    exit 0
+    ;;
+
+
+  *)
+    err usag "unknown command"
+    ;;
+esac
+
+exit 1
+
+if [[ "$cmd" = "bag_" ]] || [[ "$cmd" == bag_*-h ]]; then
+  bag_h
+else
+  "$func" $@
+fi
+
